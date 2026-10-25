@@ -27,17 +27,147 @@ const synth=window.speechSynthesis;let voice=null;
 function getVoice(){if(synth)voice=synth.getVoices().find(v=>v.lang.startsWith('en')&&/Samantha|Karen|Daniel/.test(v.name))||synth.getVoices().find(v=>v.lang.startsWith('en'));}
 if(synth){getVoice();synth.addEventListener('voiceschanged',getVoice);}
 function speak(text){if(!synth){$('#feedback').textContent='このブラウザでは読み上げが使えません';return;}synth.cancel();synth.resume();const u=new SpeechSynthesisUtterance(text==='I'?'eye':text);u.lang='en-US';if(voice)u.voice=voice;u.rate=mode==='predict'?.8:.9;u.volume=.7;synth.speak(u);}
-let effects=null,batBuffer=null,fxMaster=null,fxLimiter=null;let countdownSpoken=0,finalStarted=0,finalElapsed=0;
-function buildBatBuffer(){const rate=effects.sampleRate,buf=effects.createBuffer(1,Math.ceil(rate*1.2),rate),data=buf.getChannelData(0);let seed=123456,phase=0,peak=0;
- for(let i=0;i<data.length;i++){const t=i/rate;seed=(seed*1664525+1013904223)>>>0;const noise=seed/4294967296*2-1;
- const f=850+2350*Math.min(1,t/.085);phase+=2*Math.PI*f/rate;
- const attack=(noise*.5+Math.sin(2*Math.PI*220*t)*.4)*Math.exp(-t*95);
- const ring=(Math.sin(phase)+.42*Math.sin(phase*1.47)+.22*Math.sin(phase*2.11))*Math.min(1,t/.018)*Math.exp(-Math.max(0,t-.085)*3.8);
- const tail=Math.min(1,(1.2-t)/.08);data[i]=(attack+ring*.55)*tail;peak=Math.max(peak,Math.abs(data[i]));}
- for(let i=0;i<data.length;i++)data[i]=data[i]/Math.max(1,peak)*.9;return buf;}
-async function unlockEffects(){try{const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return false;if(!effects){effects=new AC();fxMaster=effects.createGain();fxMaster.gain.value=Number($('#fx-volume').value||45)/100;fxLimiter=effects.createDynamicsCompressor();fxLimiter.threshold.value=-18;fxLimiter.knee.value=12;fxLimiter.ratio.value=8;fxLimiter.attack.value=.003;fxLimiter.release.value=.18;fxMaster.connect(fxLimiter);fxLimiter.connect(effects.destination);batBuffer=buildBatBuffer();}if(effects.state!=='running')await effects.resume();return effects.state==='running';}catch{return false;}}
-function bounceSound(){try{if(!effects||effects.state!=='running'||!batBuffer)return;const source=effects.createBufferSource(),gain=effects.createGain();source.buffer=batBuffer;gain.gain.value=.45;source.connect(gain);gain.connect(fxMaster);source.start();source.onended=()=>{source.disconnect();gain.disconnect();};}catch{}}
-function launchSound(){try{if(!effects||effects.state!=='running')return;const t=effects.currentTime,o=effects.createOscillator(),g=effects.createGain();o.type='sine';o.frequency.setValueAtTime(440,t);o.frequency.exponentialRampToValueAtTime(230,t+.055);g.gain.setValueAtTime(.065,t);g.gain.exponentialRampToValueAtTime(.001,t+.07);o.connect(g);g.connect(fxMaster);o.start(t);o.stop(t+.08);o.onended=()=>{o.disconnect();g.disconnect();};}catch{}}
+let effects=null,batBuffer=null,noiseBuffer=null,fxMaster=null,fxLimiter=null;let countdownSpoken=0,finalStarted=0,finalElapsed=0;
+
+// 金属バット「カキーン！」波形生成（チュイーン原因の周波数上昇を廃止し、硬い打撃衝撃＋非整数倍音の金属共鳴を合成）
+function buildBatBuffer(){
+  const rate=effects.sampleRate,len=Math.ceil(rate*0.65),buf=effects.createBuffer(1,len,rate),data=buf.getChannelData(0);
+  let seed=987654321,peak=0;
+  // 高校野球の金属バット特有の非整数倍音（不協和な高域群）
+  const modes=[
+    {f:2180,amp:0.55,decay:9.5},
+    {f:3140,amp:0.48,decay:11.0},
+    {f:4450,amp:0.35,decay:14.0},
+    {f:5920,amp:0.22,decay:18.0},
+    {f:1120,amp:0.28,decay:22.0} // バット本体のコシのある中域
+  ];
+  for(let i=0;i<len;i++){
+    const t=i/rate;
+    seed=(seed*1664525+1013904223)>>>0;
+    const white=seed/4294967296*2-1;
+    // 1. ボールがバットにめり込んで弾ける瞬間の「バシッ！」という硬い衝撃音
+    const crack=white*Math.exp(-t*140)*0.85;
+    const woodSnap=Math.sin(2*Math.PI*(950*Math.exp(-t*70)+180)*t)*Math.exp(-t*85)*0.65;
+    // 2. 金属バットの「キーン！」という共鳴（打撃直後にわずかにピッチが落ち着くリアルな挙動）
+    let ring=0;
+    for(const m of modes){
+      const bend=1+0.012*Math.exp(-t*60);
+      ring+=Math.sin(2*Math.PI*m.f*bend*t)*m.amp*Math.exp(-t*m.decay);
+    }
+    const env=Math.min(1,t/0.0015);
+    data[i]=(crack+woodSnap+ring*0.8)*env;
+    peak=Math.max(peak,Math.abs(data[i]));
+  }
+  for(let i=0;i<len;i++)data[i]=data[i]/Math.max(1,peak)*0.95;
+  return buf;
+}
+
+// 汎用ノイズバッファ（発射の空気音・コア命中時の爆発クラッシュ用）
+function buildNoiseBuffer(){
+  const rate=effects.sampleRate,len=Math.ceil(rate*0.5),buf=effects.createBuffer(1,len,rate),data=buf.getChannelData(0);
+  let seed=123456789;
+  for(let i=0;i<len;i++){
+    seed=(seed*1664525+1013904223)>>>0;
+    data[i]=seed/4294967296*2-1;
+  }
+  return buf;
+}
+
+async function unlockEffects(){try{const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return false;if(!effects){effects=new AC();fxMaster=effects.createGain();fxMaster.gain.value=Number($('#fx-volume').value||45)/100;fxLimiter=effects.createDynamicsCompressor();fxLimiter.threshold.value=-14;fxLimiter.knee.value=10;fxLimiter.ratio.value=6;fxLimiter.attack.value=.002;fxLimiter.release.value=.15;fxMaster.connect(fxLimiter);fxLimiter.connect(effects.destination);batBuffer=buildBatBuffer();noiseBuffer=buildNoiseBuffer();}if(effects.state!=='running')await effects.resume();return effects.state==='running';}catch{return false;}}
+
+// 反射音：金属バットで打ち返す「カキーン！」（高得点時はより澄んだ快音に）
+function bounceSound(points=100){
+  try{
+    if(!effects||effects.state!=='running'||!batBuffer)return;
+    const t=effects.currentTime;
+    const source=effects.createBufferSource(),gain=effects.createGain();
+    source.buffer=batBuffer;
+    // ジャストミート(100/150点)は少し高めで澄んだカキーン、70点は少し鈍めのカキン
+    source.playbackRate.setValueAtTime(points>=100?1.04:0.93,t);
+    gain.gain.setValueAtTime(points>=100?0.85:0.65,t);
+    source.connect(gain);gain.connect(fxMaster);
+    source.start(t);
+    source.onended=()=>{source.disconnect();gain.disconnect();};
+  }catch{}
+}
+
+// 発射音：ピッチングマシンや穴からボールが飛び出す「ポンッ！」
+function launchSound(){
+  try{
+    if(!effects||effects.state!=='running')return;
+    const t=effects.currentTime;
+    // 1. 筒の中の空気が膨張して弾ける「ポンッ」の胴鳴り（急激に上がって一気に落ちるピッチ）
+    const o=effects.createOscillator(),g=effects.createGain();
+    o.type='sine';
+    o.frequency.setValueAtTime(130,t);
+    o.frequency.exponentialRampToValueAtTime(340,t+0.018);
+    o.frequency.exponentialRampToValueAtTime(88,t+0.11);
+    g.gain.setValueAtTime(0.001,t);
+    g.gain.linearRampToValueAtTime(0.55,t+0.006);
+    g.gain.exponentialRampToValueAtTime(0.001,t+0.12);
+    o.connect(g);g.connect(fxMaster);
+    o.start(t);o.stop(t+0.13);
+    o.onended=()=>{o.disconnect();g.disconnect();};
+
+    // 2. 穴から押し出される「ボフッ」という空気圧ノイズ
+    if(noiseBuffer){
+      const n=effects.createBufferSource(),filter=effects.createBiquadFilter(),ng=effects.createGain();
+      n.buffer=noiseBuffer;
+      filter.type='bandpass';
+      filter.frequency.setValueAtTime(520,t);
+      filter.Q.setValueAtTime(2.2,t);
+      ng.gain.setValueAtTime(0.35,t);
+      ng.gain.exponentialRampToValueAtTime(0.001,t+0.045);
+      n.connect(filter);filter.connect(ng);ng.connect(fxMaster);
+      n.start(t);n.stop(t+0.05);
+      n.onended=()=>{n.disconnect();filter.disconnect();ng.disconnect();};
+    }
+  }catch{}
+}
+
+// コア命中ダメージ音：打ち返したボールがコアに直撃したときの「ドゴォン！／バキッ！」
+function impactSound(points=100){
+  try{
+    if(!effects||effects.state!=='running')return;
+    const t=effects.currentTime;
+    // 1. 重低音インパクト（ズシンと響くサブベースの急降下）
+    const sub=effects.createOscillator(),subGain=effects.createGain();
+    sub.type='triangle';
+    sub.frequency.setValueAtTime(170,t);
+    sub.frequency.exponentialRampToValueAtTime(28,t+0.26);
+    subGain.gain.setValueAtTime(0.75,t);
+    subGain.gain.exponentialRampToValueAtTime(0.001,t+0.28);
+    sub.connect(subGain);subGain.connect(fxMaster);
+    sub.start(t);sub.stop(t+0.29);
+    sub.onended=()=>{sub.disconnect();subGain.disconnect();};
+
+    // 2. コアの外殻が砕けるクランチ音（ノコギリ波のピッチドロップ）
+    const crunch=effects.createOscillator(),crunchGain=effects.createGain();
+    crunch.type='sawtooth';
+    crunch.frequency.setValueAtTime(points>=100?320:240,t);
+    crunch.frequency.exponentialRampToValueAtTime(45,t+0.15);
+    crunchGain.gain.setValueAtTime(0.32,t);
+    crunchGain.gain.exponentialRampToValueAtTime(0.001,t+0.16);
+    crunch.connect(crunchGain);crunchGain.connect(fxMaster);
+    crunch.start(t);crunch.stop(t+0.17);
+    crunch.onended=()=>{crunch.disconnect();crunchGain.disconnect();};
+
+    // 3. 爆発クラッシュノイズ（ローパスフィルターを閉じながら減衰）
+    if(noiseBuffer){
+      const n=effects.createBufferSource(),filter=effects.createBiquadFilter(),ng=effects.createGain();
+      n.buffer=noiseBuffer;
+      filter.type='lowpass';
+      filter.frequency.setValueAtTime(2400,t);
+      filter.frequency.exponentialRampToValueAtTime(140,t+0.24);
+      ng.gain.setValueAtTime(0.65,t);
+      ng.gain.exponentialRampToValueAtTime(0.001,t+0.25);
+      n.connect(filter);filter.connect(ng);ng.connect(fxMaster);
+      n.start(t);n.stop(t+0.26);
+      n.onended=()=>{n.disconnect();filter.disconnect();ng.disconnect();};
+    }
+  }catch{}
+}
+
 function countCue(start=false){try{if(!effects||effects.state!=='running')return;const t=effects.currentTime,o=effects.createOscillator(),g=effects.createGain();o.type='sine';o.frequency.setValueAtTime(start?880:550,t);g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(start?.2:.13,t+.008);g.gain.exponentialRampToValueAtTime(.001,t+(start?.24:.1));o.connect(g);g.connect(fxMaster);o.start(t);o.stop(t+.28);o.onended=()=>{o.disconnect();g.disconnect();};}catch{}}
 function testVoice(){return new Promise(resolve=>{if(!synth){resolve(false);return;}getVoice();synth.cancel();synth.resume();const u=new SpeechSynthesisUtterance('Ready');u.lang='en-US';if(voice)u.voice=voice;u.rate=.85;u.volume=.7;let done=false;const finish=ok=>{if(done)return;done=true;clearTimeout(timer);resolve(ok);};const timer=setTimeout(()=>finish(false),7000);u.onend=()=>finish(true);u.onerror=()=>finish(false);try{synth.speak(u);}catch{finish(false);}});}
 async function prepareStart(){stop();const token=bootToken;phase='preparing';$('#start').disabled=true;$('#again').disabled=true;$('#audio-status').textContent='お試し音声「Ready」を再生しています…';$('#silent-start').hidden=true;screen('home');
@@ -78,7 +208,7 @@ function layoutTargets(){
 }
 function revealTime(n){return n.travel*(1-(cloudRadius+5)/targets[n.id].distance);}
 function deflect(n,t,points){bounceSound(points);n.armed=false;n.returning=true;n.backAt=t;n.points=points;buttons[n.id].classList.remove('armed');rings[n.id].classList.remove('ready');flash(n.id,'hit');feedback(points===150?'バリアで反撃！':points===100?'PERFECT! 強い反撃！':'GOOD! 打ち返した！');}
-function impact(n,t){n.returning=false;n.done=true;hits++;combo++;best=Math.max(best,combo);score+=pointsFor(n.points);if(n.points===150)early++;stats();$('#damage').textContent='+'+pointsFor(n.points);$('#damage').hidden=false;damageUntil=t+650;$('#center').classList.remove('impact');void $('#center').offsetWidth;$('#center').classList.add('impact');}
+function impact(n,t){impactSound(n.points);n.returning=false;n.done=true;hits++;combo++;best=Math.max(best,combo);score+=pointsFor(n.points);if(n.points===150)early++;stats();$('#damage').textContent='+'+pointsFor(n.points);$('#damage').hidden=false;damageUntil=t+650;$('#center').classList.remove('impact');void $('#center').offsetWidth;$('#center').classList.add('impact');}
 function barrierBonus(t){return pointsFor(Math.round(3000/(1+Math.max(0,t)/1000)));}
 function tick(now){if(paused||!['countdown','running','gap'].includes(phase))return;const t=now-roundStart;
  if(t<0){const count=Math.ceil(-t/1000);if(count!==countdownSpoken){countdownSpoken=count;countCue();}$('#overlay').classList.add('counting');$('#overlay-title').textContent=Math.ceil(-t/1000);$('#overlay-text').textContent='';}
